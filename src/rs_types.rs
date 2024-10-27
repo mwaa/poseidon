@@ -68,7 +68,7 @@ impl InstructionAccount {
         }
     }
 
-    pub fn to_tokens(&self) -> TokenStream {
+    pub fn to_tokens(&self, ix_a: &Vec<Ident>, realloc: &bool) -> TokenStream {
         let name = Ident::new(&self.name, proc_macro2::Span::call_site());
         let of_type = &self.of_type;
         let constraints: TokenStream;
@@ -128,14 +128,43 @@ impl InstructionAccount {
             }
             None => quote! {},
         };
+
+
+        // input1.len() + input2.len() + ...
+        let mut input_lengths: Vec<TokenStream> = vec![];
+        for s in ix_a {
+            input_lengths.push(quote!( + #s.len() ));
+        }
+
+        // space value + input1.len() + input2.len() + ...
         let space = match self.space {
             Some(s) => {
                 let s_literal = Literal::u16_unsuffixed(s);
-                quote! {space = #s_literal,}
+                quote ! {
+                    space = #s_literal #(#input_lengths)*,
+                }
             }
             None => {
                 quote! {}
             }
+        };
+
+        
+        println!("input_lengths {:?}", input_lengths);
+        println!("space {:?}", space);
+        println!("realloc {:?}", realloc);
+
+
+        let realloc = match realloc {
+            true => {
+                quote! {
+                    mut,
+                    realloc = 8 #(#input_lengths)*,
+                    realloc::payer = #payer,
+                    realloc::zero = true,
+                }
+            }
+            false => quote! {},
         };
 
         let init = match self.is_init {
@@ -176,6 +205,7 @@ impl InstructionAccount {
                     #has
                     #bump
                     #close
+                    #realloc
 
                 )]
             }
@@ -202,6 +232,13 @@ pub struct InstructionArgument {
     pub of_type: TokenStream,
     pub optional: bool,
 }
+
+#[derive(Clone, Debug)]
+pub struct InstructionAttributes {
+    pub token_streams: Vec<TokenStream>,
+    pub string_idents: Vec<Ident>
+}
+
 #[derive(Clone, Debug)]
 pub struct ProgramInstruction {
     pub name: String,
@@ -212,7 +249,8 @@ pub struct ProgramInstruction {
     pub uses_system_program: bool,
     pub uses_token_program: bool,
     pub uses_associated_token_program: bool,
-    pub instruction_attributes: Option<Vec<TokenStream>>,
+    pub instruction_attributes: InstructionAttributes,
+    pub realloc: bool,
 }
 
 impl ProgramInstruction {
@@ -226,7 +264,11 @@ impl ProgramInstruction {
             uses_system_program: false,
             uses_token_program: false,
             uses_associated_token_program: false,
-            instruction_attributes: None,
+            instruction_attributes: InstructionAttributes {
+                token_streams: vec![],
+                string_idents: vec![],
+            },
+            realloc: false,
         }
     }
     pub fn get_amount_from_ts_arg(amount_expr: &Expr) -> Result<TokenStream> {
@@ -273,9 +315,45 @@ impl ProgramInstruction {
         }
         Ok(amount)
     }
+    pub fn get_instruction_attributes(&mut self, elems: &Vec<Option<ExprOrSpread>>) -> Result<InstructionAttributes> {
+        let mut ix_attribute_token: Vec<TokenStream> = vec![];
+        let mut ix_strings_list: Vec<Ident> = vec![];
+
+        for elem in elems.into_iter().flatten() {
+            let arg_name = elem.expr
+                .as_ident()
+                .ok_or(PoseidonError::IdentNotFound)?
+                .sym.to_string()
+                .to_case(Case::Snake);
+            let arg_ident = Ident::new(&arg_name, Span::call_site());
+
+            for arg in self.args.iter() {
+                if arg.name == arg_name {
+                    let type_ident = &arg.of_type;
+                    
+                    ix_attribute_token.push(quote! {
+                        #arg_ident : #type_ident
+                    });
+
+                    let is_string_attribute = type_ident
+                        .to_string()
+                        .contains("tring");
+
+                    if is_string_attribute {
+                        ix_strings_list.push(Ident::new(arg_name.clone().as_str(), Span::call_site()));
+                    }
+                }
+            }
+        }
+
+        Ok(InstructionAttributes {
+            token_streams: ix_attribute_token,
+            string_idents: ix_strings_list,
+        })
+    }
     pub fn get_seeds(&mut self, seeds: &Vec<Option<ExprOrSpread>>) -> Result<Vec<TokenStream>> {
         let mut seeds_token: Vec<TokenStream> = vec![];
-        let mut ix_attribute_token: Vec<TokenStream> = vec![];
+        
         for elem in seeds.into_iter().flatten() {
             match *(elem.expr.clone()) {
                 Expr::Lit(Lit::Str(seedstr)) => {
@@ -340,15 +418,6 @@ impl ProgramInstruction {
                             });
                         }
 
-                        for arg in self.args.iter() {
-                            if arg.name == seed_obj {
-                                let type_ident = &arg.of_type;
-
-                                ix_attribute_token.push(quote! {
-                                    #seed_obj_ident : #type_ident
-                                })
-                            }
-                        }
                     } else if seed_members.obj.is_member() {
                         if seed_members
                             .prop
@@ -389,9 +458,6 @@ impl ProgramInstruction {
                 }
                 _ => {}
             }
-        }
-        if !ix_attribute_token.is_empty() {
-            self.instruction_attributes = Some(ix_attribute_token);
         }
         Ok(seeds_token)
     }
@@ -581,6 +647,7 @@ impl ProgramInstruction {
                                         derive_args = &c.args;
                                     }
                                 }
+
                                 if let Some(cur_ix_acc) = ix_accounts.get_mut(obj) {
                                     if prop.contains("derive") {
                                         let chaincall1prop = c
@@ -662,6 +729,39 @@ impl ProgramInstruction {
                                             cur_ix_acc.bump = Some(quote!{
                                                 bump = #bump_obj.#bump_prop
                                             })
+                                        }
+
+                                        println!("chaincall1prop {:?}", chaincall1prop);
+                                        println!("chaincall2prop {:?}", chaincall2prop);
+
+
+                                        if chaincall2prop == "instruction" {
+                                            let elems = &c.callee.as_expr()
+                                                .ok_or(PoseidonError::ExprNotFound)?
+                                                .as_member()
+                                                .ok_or(PoseidonError::MemberNotFound)?
+                                                .obj.as_call()
+                                                .ok_or(PoseidonError::CallNotFound)?
+                                                .args[0]
+                                                .expr.as_array()
+                                                .ok_or(anyhow!("expected a array"))?
+                                                .elems;
+
+                                            // Retrieve the second argument as a boolean
+                                            let second_arg = c.callee.as_expr().ok_or(PoseidonError::ExprNotFound)?
+                                                .as_member().ok_or(PoseidonError::MemberNotFound)?
+                                                .obj.as_call().ok_or(PoseidonError::CallNotFound)?
+                                                .args.get(1); // Get the second argument
+
+                                            ix.realloc = match second_arg {
+                                                Some(arg) => match &*arg.expr {
+                                                    Expr::Lit(Lit::Bool(b)) => b.value,
+                                                    _ => false, // Default to false if not a boolean literal
+                                                },
+                                                None => false, // Default to false if the second argument is not present
+                                            };
+                                            
+                                            ix.instruction_attributes = ix.get_instruction_attributes(elems).expect("instruction attributes not found");
                                         }
 
                                         if chaincall1prop == "init" {
@@ -1240,15 +1340,13 @@ impl ProgramInstruction {
             &format!("{}Context", &self.name.to_case(Case::Pascal)),
             proc_macro2::Span::call_site(),
         );
-        let mut accounts: Vec<TokenStream> = self.accounts.iter().map(|a| a.to_tokens()).collect();
+        let ix_a = &self.instruction_attributes;
+        let s = &ix_a.token_streams;
 
-        let ix_attributes = match &self.instruction_attributes {
-            Some(s) => {
-                quote! {
-                    #[instruction(#(#s),*)]
-                }
-            }
-            None => quote! {},
+        let mut accounts: Vec<TokenStream> = self.accounts.iter().map(|a| a.to_tokens(&ix_a.string_idents, &self.realloc)).collect();
+
+        let ix_attributes = quote! {
+            #[instruction(#(#s)*)]
         };
         if self.uses_associated_token_program {
             accounts.push(quote! {
@@ -1265,6 +1363,12 @@ impl ProgramInstruction {
                 pub system_program: Program<'info, System>,
             })
         }
+
+
+        println!("---------------------------------");
+        println!("{:?}", ix_attributes);
+        println!("---------------------------------");
+
         quote! {
             #[derive(Accounts)]
             #ix_attributes
@@ -1355,7 +1459,7 @@ impl ProgramAccount {
                 let (field_type, _optional) = extract_of_type(binding)
                     .unwrap_or_else(|_| panic!("Keyword type is not supported"));
 
-                // TODO:: space of other types e.g string or move to macro InitSpace
+                // Reference https://book.anchor-lang.com/anchor_references/space.html
                 match field_type.as_str() {
                     "Pubkey" => {
                         space += 32;
@@ -1371,6 +1475,9 @@ impl ProgramAccount {
                     }
                     "u8" | "i8" => {
                         space += 1;
+                    }
+                    "string" | "String" | "Vec<string>" | "Vec<String>" => {
+                        space += 4; // initial 4 bytes for string types
                     }
                     _ => {}
                 }
